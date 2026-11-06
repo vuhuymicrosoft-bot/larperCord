@@ -49,6 +49,13 @@ jobs:
                   fn + "\n    const s = if (windows) c.socket(c.AF_INET, c.SOCK_STREAM, 0) else c.socket(c.AF_INET, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0);",
                   fn + "\n    const s = if (windows) c.socket(c.AF_INET, c.SOCK_STREAM, 0) else cloexecSocket(c.SOCK_STREAM);")
 
+          # 2b. translate-c nao traduz a macro SIG_IGN no macOS: ela e (void(*)(int))1
+          sub("src/platform/sys.zig",
+              "        _ = c.signal(c.SIGPIPE, c.SIG_IGN);",
+              "        if (builtin.os.tag == .macos) {\n"
+              "            _ = c.signal(c.SIGPIPE, @ptrFromInt(1));\n"
+              "        } else _ = c.signal(c.SIGPIPE, c.SIG_IGN);")
+
           # 3. inotify so existe no Linux (no macOS o tema nao recarrega sozinho)
           sub("src/theme/manager.zig", 'const std = @import("std");\n', 'const std = @import("std");\nconst builtin = @import("builtin");\n')
           sub("src/theme/manager.zig",
