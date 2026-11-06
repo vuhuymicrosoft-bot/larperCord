@@ -1,0 +1,118 @@
+name: build-macos-intel
+
+# Build larperCord (0.6.0) cho Mac Intel tren may cua GitHub. Chay tay: Actions -> build-macos-intel -> Run workflow.
+# Ket qua: file larpercord-macos-intel.zip trong muc Artifacts cua lan chay (da kem san thu vien, khong can brew tren may ban).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    steps:
+      - name: Tai larperCord 0.6.0
+        run: |
+          git clone https://github.com/RshaCuDeVidro/larperCord src
+          git -C src checkout 202198b8988f3c7ec9583b37e95e39d0713d895d
+
+      - name: Va cho chay macOS
+        working-directory: src
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          def sub(path, old, new):
+              p = pathlib.Path(path)
+              s = p.read_text()
+              assert s.count(old) == 1, f"{path}: khong khop dung 1 cho: {old[:50]!r}"
+              p.write_text(s.replace(old, new))
+
+          # 1. Header chi co tren Linux
+          sub("src/c.h", "#include <sys/inotify.h>\n", "#ifdef __linux__\n#include <sys/inotify.h>\n#endif\n")
+          sub("src/c.h", "#include <malloc.h>\n", "#ifdef __linux__\n#include <malloc.h>\n#endif\n")
+
+          # 2. macOS khong co SOCK_CLOEXEC
+          sub("src/platform/sys.zig",
+              "    const s = c.socket(c.AF_INET, c.SOCK_DGRAM | c.SOCK_CLOEXEC, 0);\n    return if (s < 0) null else s;\n}\n",
+              "    const s = cloexecSocket(c.SOCK_DGRAM);\n    return if (s < 0) null else s;\n}\n\n"
+              "fn cloexecSocket(kind: c_int) c_int {\n"
+              "    if (builtin.os.tag == .macos) {\n"
+              "        const s = c.socket(c.AF_INET, kind, 0);\n"
+              "        if (s >= 0) _ = c.fcntl(s, c.F_SETFD, @as(c_int, c.FD_CLOEXEC));\n"
+              "        return s;\n"
+              "    }\n"
+              "    return c.socket(c.AF_INET, kind | c.SOCK_CLOEXEC, 0);\n"
+              "}\n")
+          for fn in ("pub fn tcpListenLocal(port: *u16) ?Socket {", "pub fn tcpConnectLocal(port: u16) ?Socket {"):
+              sub("src/platform/sys.zig",
+                  fn + "\n    const s = if (windows) c.socket(c.AF_INET, c.SOCK_STREAM, 0) else c.socket(c.AF_INET, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0);",
+                  fn + "\n    const s = if (windows) c.socket(c.AF_INET, c.SOCK_STREAM, 0) else cloexecSocket(c.SOCK_STREAM);")
+
+          # 3. inotify so existe no Linux (no macOS o tema nao recarrega sozinho)
+          sub("src/theme/manager.zig", 'const std = @import("std");\n', 'const std = @import("std");\nconst builtin = @import("builtin");\n')
+          sub("src/theme/manager.zig",
+              "        if (sys.windows) return m.watchWindows(wake);\n        const fd = c.inotify_init1(c.IN_CLOEXEC);",
+              "        if (sys.windows) return m.watchWindows(wake);\n"
+              "        if (builtin.os.tag == .linux) return m.watchInotify(wake);\n"
+              "    }\n\n"
+              "    fn watchInotify(m: *Manager, wake: *const fn () void) void {\n"
+              "        const fd = c.inotify_init1(c.IN_CLOEXEC);")
+
+          # 4. Tabelas de unwind: o C++ da voz usa excecoes e o Mach-O precisa delas
+          sub("build.zig",
+              ".unwind_tables = if (release and target.result.os.tag != .windows) .none else null,",
+              ".unwind_tables = if (release and target.result.os.tag != .windows and target.result.os.tag != .macos) .none else null,")
+          print("va OK")
+          PY
+          git diff --stat
+
+      - name: Cai thu vien (chi tren may GitHub)
+        run: |
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          brew install pkgconf sdl3 freetype fontconfig curl zlib webp opus openssl@3 dylibbundler
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Build
+        working-directory: src
+        run: |
+          set -o pipefail
+          for f in openssl@3 curl zlib sdl3 webp opus freetype fontconfig; do
+            export PKG_CONFIG_PATH="$(brew --prefix $f)/lib/pkgconfig:$PKG_CONFIG_PATH"
+          done
+          zig version
+          zig build -Doptimize=ReleaseFast 2>&1 | tee ../build.log
+
+      - name: Gom thu vien de chay khong can brew
+        run: |
+          set -e
+          mkdir -p dist/larpercord
+          cp src/zig-out/bin/larpercord dist/larpercord/larpercord-bin
+          dylibbundler -cd -od -b -x dist/larpercord/larpercord-bin -d dist/larpercord/libs -p @executable_path/libs
+          cat > dist/larpercord/fonts.conf <<'XML'
+          <?xml version="1.0"?>
+          <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+          <fontconfig>
+            <dir>/System/Library/Fonts</dir>
+            <dir>/System/Library/Fonts/Supplemental</dir>
+            <dir>/Library/Fonts</dir>
+            <dir>~/Library/Fonts</dir>
+            <cachedir prefix="xdg">fontconfig</cachedir>
+          </fontconfig>
+          XML
+          printf '#!/bin/sh\nD="$(cd "$(dirname "$0")" && pwd)"\nexport FONTCONFIG_FILE="$D/fonts.conf"\nexec "$D/larpercord-bin" "$@"\n' > dist/larpercord/larpercord
+          chmod +x dist/larpercord/larpercord dist/larpercord/larpercord-bin
+          find dist -type f \( -name '*.dylib' -o -name larpercord-bin \) -exec codesign --force -s - {} \;
+          otool -L dist/larpercord/larpercord-bin
+          (cd dist && zip -r ../larpercord-macos-intel.zip larpercord)
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: larpercord-macos-intel
+          path: |
+            larpercord-macos-intel.zip
+            build.log
